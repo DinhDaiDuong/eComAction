@@ -1,0 +1,215 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '16'
+  METRICS_FILE: 'pipeline-metrics.csv'
+  FRONTEND_IMAGE: ghcr.io/${{ github.repository }}/frontend:${{ github.sha }}
+  BACKEND_IMAGE: ghcr.io/${{ github.repository }}/backend:${{ github.sha }}
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Install Frontend Dependencies
+        working-directory: ecomResource/eCommerce_Reactjs
+        run: npm install
+        
+      - name: Install Backend Dependencies
+        working-directory: ecomResource/ecomAPI
+        run: npm install
+        
+      - name: Cache Frontend Dependencies
+        uses: actions/cache@v2
+        with:
+          path: ecomResource/eCommerce_Reactjs/node_modules
+          key: frontend-deps-${{ hashFiles('ecomResource/eCommerce_Reactjs/package-lock.json') }}
+          
+      - name: Cache Backend Dependencies
+        uses: actions/cache@v2
+        with:
+          path: ecomResource/ecomAPI/node_modules
+          key: backend-deps-${{ hashFiles('ecomResource/ecomAPI/package-lock.json') }}
+
+  test:
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Restore Dependencies Cache
+        uses: actions/cache@v2
+        with:
+          path: |
+            ecomResource/eCommerce_Reactjs/node_modules
+            ecomResource/ecomAPI/node_modules
+          key: deps-${{ hashFiles('**/package-lock.json') }}
+          
+      - name: Test Frontend
+        working-directory: ecomResource/eCommerce_Reactjs
+        run: npm test --passWithNoTests
+        
+      - name: Test Backend
+        working-directory: ecomResource/ecomAPI
+        run: npm test --passWithNoTests
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v1
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Build and Push Frontend
+        uses: docker/build-push-action@v2
+        with:
+          context: ecomResource/eCommerce_Reactjs
+          push: true
+          tags: ${{ env.FRONTEND_IMAGE }}
+          
+      - name: Build and Push Backend
+        uses: docker/build-push-action@v2
+        with:
+          context: ecomResource/ecomAPI
+          push: true
+          tags: ${{ env.BACKEND_IMAGE }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Create docker-compose.yml
+        run: |
+          cat > docker-compose.yml << EOF
+          version: '3.8'
+          services:
+            frontend:
+              image: ${{ env.FRONTEND_IMAGE }}
+              container_name: ecom-frontend
+              ports:
+                - "80:80"
+              depends_on:
+                - backend
+              restart: always
+              networks:
+                - ecom-network
+            backend:
+              image: ${{ env.BACKEND_IMAGE }}
+              container_name: ecom-backend
+              ports:
+                - "3000:3000"
+              environment:
+                - NODE_ENV=production
+              restart: always
+              networks:
+                - ecom-network
+          networks:
+            ecom-network:
+              driver: bridge
+          EOF
+          
+      - name: Deploy with docker-compose
+        run: |
+          docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+          docker pull ${{ env.FRONTEND_IMAGE }}
+          docker pull ${{ env.BACKEND_IMAGE }}
+          docker-compose up -d
+
+  metrics:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Create metrics directory
+        run: mkdir -p metrics
+        
+      - name: Frontend Build Metrics
+        run: |
+          START_TIME=$(date +%s%N)
+          cd ecomResource/eCommerce_Reactjs
+          npm install
+          npm test --passWithNoTests || true
+          CI=false npm run build
+          END_TIME=$(date +%s%N)
+          DURATION=$((($END_TIME - $START_TIME)/1000000))
+          echo $DURATION > ../metrics/frontend-build.txt
+          
+      - name: Backend Build Metrics
+        run: |
+          START_TIME=$(date +%s%N)
+          cd ecomResource/ecomAPI
+          npm install
+          npm test --passWithNoTests || true
+          CI=false npm run build
+          END_TIME=$(date +%s%N)
+          DURATION=$((($END_TIME - $START_TIME)/1000000))
+          echo $DURATION > ../metrics/backend-build.txt
+          
+      - name: Resource Monitor
+        run: |
+          CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}')
+          MEM_USAGE=$(free -m | awk 'NR==2{printf "%.2f", $3*100/$2}')
+          DISK_USAGE=$(df -h / | awk 'NR==2{print $5}')
+          
+          echo "CPU: ${CPU_USAGE}%" > metrics/resources.txt
+          echo "Memory: ${MEM_USAGE}%" >> metrics/resources.txt
+          echo "Disk: ${DISK_USAGE}" >> metrics/resources.txt
+          
+      - name: Generate Report
+        run: |
+          cat > pipeline-report.md << EOF
+          # Pipeline Report
+          
+          ## Build Times
+          - Backend Build: $(cat metrics/backend-build.txt)ms
+          - Frontend Build: $(cat metrics/frontend-build.txt)ms
+          
+          ## Resource Usage
+          $(cat metrics/resources.txt)
+          
+          ## Pipeline Information
+          - Commit: ${{ github.sha }}
+          - Branch: ${{ github.ref }}
+          - Run ID: ${{ github.run_id }}
+          EOF
+          
+      - name: Upload Metrics Artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: pipeline-metrics
+          path: |
+            metrics/
+            pipeline-report.md
